@@ -1,0 +1,9 @@
+# Base de données locale
+luxury_inventory.db
+
+# Fichiers Python et environnements
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
