@@ -9,6 +9,13 @@ import plotly.express as px
 from lifelines import KaplanMeierFitter, CoxPHFitter
 import yfinance as yf
 from datetime import datetime
+import streamlit as st
+import pandas as pd
+import sqlite3
+import yfinance as yf
+import os
+from datetime import datetime
+from data_generator import generate_luxury_data # Import de ton script de génération
 
 # ==========================================
 # CONFIGURATION LUXE & STYLE
@@ -30,65 +37,67 @@ st.markdown("""
 
 @st.cache_data(ttl=60)
 def load_internal_data():
-    """Charge les données inventaire et génère la DB si absente."""
+    """Charge les données et génère la DB si elle est absente ou vide."""
     db_path = 'luxury_inventory.db'
     
-    # ÉTAPE A : Vérification de l'existence de la DB
+    # 1. Sécurité : Si le fichier n'existe pas du tout
     if not os.path.exists(db_path):
-        with st.status("🏗️ Initialisation de la base de données Cloud...", expanded=True) as status:
-            st.write("Fichier .db introuvable. Lancement du générateur V4...")
-            generate_luxury_data(n_products=50000) # 50k pour la rapidité du premier déploiement
-            status.update(label="✅ Base de données générée !", state="complete", expanded=False)
-
-    # ÉTAPE B : Connexion et lecture
+        with st.status("🏗️ Base de données absente. Génération en cours...", expanded=True):
+            generate_luxury_data(n_products=50000)
+    
     conn = sqlite3.connect(db_path)
     try:
         df = pd.read_sql("SELECT * FROM inventory", conn)
-    except Exception as e:
-        # Si la table 'inventory' n'existe pas dans le fichier
-        st.error(f"Erreur de structure SQL. Régénération forcée...")
-        generate_luxury_data(n_products=50000)
+        if df.empty: raise ValueError("DB Vide")
+    except Exception:
+        # 2. Sécurité : Si le fichier existe mais que la table est corrompue/vide
+        with st.status("🛠️ Erreur de structure SQL. Régénération forcée...", expanded=True):
+            generate_luxury_data(n_products=50000)
         df = pd.read_sql("SELECT * FROM inventory", conn)
     finally:
         conn.close()
 
-    # ÉTAPE C : Nettoyage et typage
-    # On s'assure que les dates sont bien des objets Datetime pour les graphiques
+    # 3. Nettoyage des dates (Crucial pour les graphiques)
     df['date_entree'] = pd.to_datetime(df['date_entree'], errors='coerce')
     df['date_vente'] = pd.to_datetime(df['date_vente'], errors='coerce')
-    
     return df
 
 @st.cache_data(ttl=3600)
 def get_historical_forex():
-    """Récupère les cours EUR/JPY via Yahoo Finance."""
+    """Récupère EUR/JPY avec un Taux de Secours (Fallback) si Yahoo bloque."""
     try:
+        # On tente de récupérer les vraies données
         data = yf.download('EURJPY=X', period='5y', interval='1d', progress=False)
         
-        if data.empty:
-            st.error("Impossible de récupérer les données Forex. Serveur Yahoo indisponible.")
-            return pd.DataFrame()
-
-        # Nettoyage MultiIndex (spécifique à yfinance)
+        if data.empty or 'Close' not in data.columns:
+            raise ConnectionError("Yahoo Finance indisponible")
+            
+        # Nettoyage si MultiIndex (version récente de yfinance)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
             
         return data
-    except Exception as e:
-        st.sidebar.error(f"Flux Finance interrompu : {e}")
-        return pd.DataFrame()
+    
+    except Exception:
+        # --- MODE DÉGRADÉ (SÉCURITÉ) ---
+        # Si Yahoo Finance bloque (fréquent sur Streamlit Cloud), on simule un taux
+        st.sidebar.warning("⚠️ Flux Forex indisponible. Utilisation d'un taux fixe (Fallback).")
+        dates = pd.date_range(end=datetime.now(), periods=100)
+        return pd.DataFrame({'Close': [160.50] * 100}, index=dates)
 
-# --- INITIALISATION DES MOTEURS ---
+# --- INITIALISATION DES VARIABLES GLOBALES ---
 df = load_internal_data()
 df_forex_hist = get_historical_forex()
 
-# Sécurité : On ne calcule les KPIs que si le Forex a répondu
+# Calcul sécurisé des KPIs Forex
 if not df_forex_hist.empty:
-    current_rate = df_forex_hist['Close'].iloc[-1]
-    rate_start = df_forex_hist['Close'].iloc[0]
+    current_rate = float(df_forex_hist['Close'].iloc[-1])
+    rate_start = float(df_forex_hist['Close'].iloc[0])
     global_trend = ((current_rate - rate_start) / rate_start) * 100
 else:
-    current_rate, global_trend = 160.0, 0.0 # Valeurs par défaut pour éviter le crash
+    current_rate, global_trend = 160.0, 0.0
+
+    
 # ==========================================
 # 2. SIDEBAR STRATÉGIQUE (WAR ROOM)
 # ==========================================
@@ -224,11 +233,15 @@ with tab_live:
     
     if not df_sold.empty:
         # Fréquence 'ME' = Month End
-        df_trend = df_sold.groupby([pd.Grouper(key='date_vente', freq='M'), 'region']).agg(Volume_Ventes=('product_id', 'count')).reset_index()
+        # Bloc compatible toutes versions de Pandas (PC + Cloud)
+        try:
+            df_trend = df_sold.groupby([pd.Grouper(key='date_vente', freq='ME'), 'region']).agg(Volume_Ventes=('product_id', 'count')).reset_index()
+        except ValueError:
+            df_trend = df_sold.groupby([pd.Grouper(key='date_vente', freq='M'), 'region']).agg(Volume_Ventes=('product_id', 'count')).reset_index()
         
         fig_trend = px.area(df_trend, x='date_vente', y='Volume_Ventes', color='region', color_discrete_map={'Europe': '#2C3E50', 'Asie': '#E74C3C'}, line_shape='spline')
         fig_trend.update_traces(mode='lines+markers', marker=dict(size=4), hovertemplate="<b>%{x|%B %Y}</b><br>Ventes: <b>%{y} pièces</b><extra></extra>")
-        fig_trend.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="", yaxis_title="Volume de ventes", legend_title="", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), plot_bgcolor='rgba(0,0,0,0)', xaxis=dict(showgrid=True, gridcolor='#F2F3F4', dtick="M3", tickformat="%b %Y"), yaxis=dict(showgrid=True, gridcolor='#F2F3F4'))
+        fig_trend.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="", yaxis_title="Volume de ventes", legend_title="", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig_trend, use_container_width=True)
     else:
         st.info("Aucune vente enregistrée pour les filtres actuels.")
