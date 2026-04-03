@@ -1,4 +1,6 @@
 import streamlit as st
+import os
+from data_generator import generate_luxury_data # On importe ta fonction de génération
 import pandas as pd
 import numpy as np
 import sqlite3
@@ -23,31 +25,70 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. DATA HUB
+# 1. DATA HUB (SÉCURISÉ & AUTO-RÉPARABLE)
 # ==========================================
+
 @st.cache_data(ttl=60)
 def load_internal_data():
-    conn = sqlite3.connect('luxury_inventory.db')
-    df = pd.read_sql("SELECT * FROM inventory", conn)
-    conn.close()
-    # Conversion des dates
-    df['date_entree'] = pd.to_datetime(df['date_entree'])
-    df['date_vente'] = pd.to_datetime(df['date_vente'])
+    """Charge les données inventaire et génère la DB si absente."""
+    db_path = 'luxury_inventory.db'
+    
+    # ÉTAPE A : Vérification de l'existence de la DB
+    if not os.path.exists(db_path):
+        with st.status("🏗️ Initialisation de la base de données Cloud...", expanded=True) as status:
+            st.write("Fichier .db introuvable. Lancement du générateur V4...")
+            generate_luxury_data(n_products=50000) # 50k pour la rapidité du premier déploiement
+            status.update(label="✅ Base de données générée !", state="complete", expanded=False)
+
+    # ÉTAPE B : Connexion et lecture
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql("SELECT * FROM inventory", conn)
+    except Exception as e:
+        # Si la table 'inventory' n'existe pas dans le fichier
+        st.error(f"Erreur de structure SQL. Régénération forcée...")
+        generate_luxury_data(n_products=50000)
+        df = pd.read_sql("SELECT * FROM inventory", conn)
+    finally:
+        conn.close()
+
+    # ÉTAPE C : Nettoyage et typage
+    # On s'assure que les dates sont bien des objets Datetime pour les graphiques
+    df['date_entree'] = pd.to_datetime(df['date_entree'], errors='coerce')
+    df['date_vente'] = pd.to_datetime(df['date_vente'], errors='coerce')
+    
     return df
 
 @st.cache_data(ttl=3600)
 def get_historical_forex():
-    data = yf.download('EURJPY=X', period='5y', interval='1d', progress=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    return data
+    """Récupère les cours EUR/JPY via Yahoo Finance."""
+    try:
+        data = yf.download('EURJPY=X', period='5y', interval='1d', progress=False)
+        
+        if data.empty:
+            st.error("Impossible de récupérer les données Forex. Serveur Yahoo indisponible.")
+            return pd.DataFrame()
 
+        # Nettoyage MultiIndex (spécifique à yfinance)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+            
+        return data
+    except Exception as e:
+        st.sidebar.error(f"Flux Finance interrompu : {e}")
+        return pd.DataFrame()
+
+# --- INITIALISATION DES MOTEURS ---
 df = load_internal_data()
 df_forex_hist = get_historical_forex()
-current_rate = df_forex_hist['Close'].iloc[-1]
-rate_start = df_forex_hist['Close'].iloc[0]
-global_trend = ((current_rate - rate_start) / rate_start) * 100
 
+# Sécurité : On ne calcule les KPIs que si le Forex a répondu
+if not df_forex_hist.empty:
+    current_rate = df_forex_hist['Close'].iloc[-1]
+    rate_start = df_forex_hist['Close'].iloc[0]
+    global_trend = ((current_rate - rate_start) / rate_start) * 100
+else:
+    current_rate, global_trend = 160.0, 0.0 # Valeurs par défaut pour éviter le crash
 # ==========================================
 # 2. SIDEBAR STRATÉGIQUE (WAR ROOM)
 # ==========================================
